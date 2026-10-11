@@ -15,6 +15,7 @@
 package shell_operator
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/flant/shell-operator/pkg/hook"
@@ -33,8 +34,14 @@ type HookTaskFactory struct{}
 
 // NewHookRunTask creates a HookRun task populated from a hook and a BindingExecutionInfo.
 // It sets the CompactionID to hook.Name and copies QueueName from info.QueueName.
+//
+// Admission (validating/mutating) and conversion tasks are explicitly marked
+// non-recoverable at creation: their response is delivered synchronously to a
+// live API server call and can neither be serialized nor replayed after a
+// restart. The queue/handler then owes the caller a definitive failure instead
+// of silently losing the task.
 func (HookTaskFactory) NewHookRunTask(hookName string, bindingType types.BindingType, info controller.BindingExecutionInfo, logLabels map[string]string) task.Task {
-	return task.NewTask(task_metadata.HookRun).
+	newTask := task.NewTask(task_metadata.HookRun).
 		WithMetadata(task_metadata.HookMetadata{
 			HookName:       hookName,
 			BindingType:    bindingType,
@@ -46,6 +53,13 @@ func (HookTaskFactory) NewHookRunTask(hookName string, bindingType types.Binding
 		WithLogLabels(logLabels).
 		WithQueueName(info.QueueName).
 		WithCompactionID(hookName)
+
+	switch bindingType {
+	case types.KubernetesValidating, types.KubernetesMutating, types.KubernetesConversion:
+		newTask.MarkNonRecoverable(fmt.Sprintf("%s response is delivered synchronously and cannot be replayed after restart", bindingType))
+	}
+
+	return newTask
 }
 
 // NewSyncHookRunTask creates a HookRun task for the Kubernetes synchronization flow.

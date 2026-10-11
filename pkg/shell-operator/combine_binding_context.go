@@ -65,6 +65,13 @@ func (op *ShellOperator) combineBindingContextForHook(tqs *queue.TaskQueueSet, q
 			stopIterate = true
 		}
 
+		// Never combine contexts across a restart (checkpoint) generation
+		// boundary: restored tasks must keep representing only the contexts
+		// they held before the restart.
+		if tsk.GetBirthEpoch() != t.GetBirthEpoch() {
+			stopIterate = true
+		}
+
 		if !stopIterate {
 			otherTasks = append(otherTasks, tsk)
 		}

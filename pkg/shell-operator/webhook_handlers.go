@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/deckhouse/deckhouse/pkg/log"
 	"github.com/gofrs/uuid/v5"
@@ -62,6 +63,13 @@ func NewAdmissionEventHandler(hm hook.HookManager, runner TaskRunner, factory Ho
 // Handle implements the admission event handler func signature expected by
 // admission.WebhookManager.WithAdmissionEventHandler.
 func (h *AdmissionEventHandler) Handle(ctx context.Context, event admission.Event) (*admission.Response, error) {
+	// The task is non-recoverable: if the operator is already shutting down,
+	// fail the API server call deterministically instead of queuing work whose
+	// response can never be delivered.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("admission webhook task cannot be recovered during shutdown: %w", err)
+	}
+
 	eventBindingType := h.hookManager.DetectAdmissionEventType(event)
 	logLabels := map[string]string{
 		pkg.LogKeyEventID: uuid.Must(uuid.NewV4()).String(),
@@ -85,23 +93,42 @@ func (h *AdmissionEventHandler) Handle(ctx context.Context, event admission.Even
 		return nil, fmt.Errorf("no hook found for '%s' '%s'", event.ConfigurationId, event.WebhookId)
 	}
 
-	res := h.taskRunner(ctx, admissionTask)
-
-	if res.Status == "Fail" {
-		return &admission.Response{
-			Allowed: false,
-			Message: "Hook failed",
-		}, nil
+	type handleResult struct {
+		response *admission.Response
+		err      error
 	}
+	done := make(chan handleResult, 1)
+	go func(t task.Task) {
+		res := h.taskRunner(ctx, t)
 
-	admissionProp := admissionTask.GetProp("admissionResponse")
-	admissionResponse, ok := admissionProp.(*admission.Response)
-	if !ok {
-		logEntry.Error("'admissionResponse' task prop is not of type *AdmissionResponse",
-			slog.String(pkg.LogKeyType, fmt.Sprintf("%T", admissionProp)))
-		return nil, fmt.Errorf("hook task prop error")
+		if res.Status == "Fail" {
+			done <- handleResult{response: &admission.Response{
+				Allowed: false,
+				Message: "Hook failed",
+			}}
+			return
+		}
+
+		admissionProp := t.GetProp("admissionResponse")
+		admissionResponse, ok := admissionProp.(*admission.Response)
+		if !ok {
+			logEntry.Error("'admissionResponse' task prop is not of type *AdmissionResponse",
+				slog.String(pkg.LogKeyType, fmt.Sprintf("%T", admissionProp)))
+			done <- handleResult{err: fmt.Errorf("hook task prop error")}
+			return
+		}
+		done <- handleResult{response: admissionResponse}
+	}(admissionTask)
+
+	select {
+	case r := <-done:
+		return r.response, r.err
+	case <-ctx.Done():
+		// Deliver the definitive failure promised by the non-recoverable
+		// marker; the in-flight goroutine observes the same canceled context.
+		admissionTask.FailNonRecoverable(ctx.Err())
+		return nil, fmt.Errorf("admission webhook task cannot be recovered during shutdown: %w", ctx.Err())
 	}
-	return admissionResponse, nil
 }
 
 // ConversionEventHandler handles conversion webhook events by finding the conversion
@@ -128,84 +155,122 @@ func NewConversionEventHandler(hm hook.HookManager, runner TaskRunner, factory H
 // Handle implements the conversion event handler func signature expected by
 // conversion.WebhookManager.EventHandlerFn.
 func (h *ConversionEventHandler) Handle(ctx context.Context, crdName string, request *v1.ConversionRequest) (*conversion.Response, error) {
+	// Conversion tasks are non-recoverable: refuse deterministically when the
+	// operator is already shutting down.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("conversion webhook task cannot be recovered during shutdown: %w", err)
+	}
+
 	logLabels := map[string]string{
 		pkg.LogKeyEventID: uuid.Must(uuid.NewV4()).String(),
 		pkg.LogKeyBinding: string(types.KubernetesConversion),
 	}
 	logEntry := utils.EnrichLoggerWithLabels(h.logger, logLabels)
 
-	sourceVersions := conversion.ExtractAPIVersions(request.Objects)
-	logEntry.Info("Handle kubernetesCustomResourceConversion event for crd",
-		slog.String(pkg.LogKeyName, crdName),
-		slog.Int(pkg.LogKeyLen, len(request.Objects)),
-		slog.Any(pkg.LogKeyVersions, sourceVersions))
+	// Track created tasks so a shutdown can deliver their definitive failure.
+	var tasksMu sync.Mutex
+	var createdTasks []task.Task
 
-	done := false
-	for _, srcVer := range sourceVersions {
-		rule := conversion.Rule{
-			FromVersion: srcVer,
-			ToVersion:   request.DesiredAPIVersion,
-		}
-		convPath := h.hookManager.FindConversionChain(crdName, rule)
-		if len(convPath) == 0 {
-			continue
-		}
-		logEntry.Info("Find conversion path for rule",
-			slog.String(pkg.LogKeyName, rule.String()),
-			slog.Any(pkg.LogKeyValue, convPath))
+	type handleResult struct {
+		response *conversion.Response
+		err      error
+	}
+	resultCh := make(chan handleResult, 1)
 
-		factory := h.taskFactory
-		for _, convRule := range convPath {
-			var convTask task.Task
-			h.hookManager.HandleConversionEvent(ctx, crdName, request, convRule, func(hk *hook.Hook, info controller.BindingExecutionInfo) {
-				convTask = factory.NewHookRunTask(hk.Name, types.KubernetesConversion, info, logLabels)
-			})
+	go func() {
+		sourceVersions := conversion.ExtractAPIVersions(request.Objects)
+		logEntry.Info("Handle kubernetesCustomResourceConversion event for crd",
+			slog.String(pkg.LogKeyName, crdName),
+			slog.Int(pkg.LogKeyLen, len(request.Objects)),
+			slog.Any(pkg.LogKeyVersions, sourceVersions))
 
-			if convTask == nil {
-				return nil, fmt.Errorf("no hook found for '%s' event for crd/%s", string(types.KubernetesConversion), crdName)
+		done := false
+		for _, srcVer := range sourceVersions {
+			rule := conversion.Rule{
+				FromVersion: srcVer,
+				ToVersion:   request.DesiredAPIVersion,
+			}
+			convPath := h.hookManager.FindConversionChain(crdName, rule)
+			if len(convPath) == 0 {
+				continue
+			}
+			logEntry.Info("Find conversion path for rule",
+				slog.String(pkg.LogKeyName, rule.String()),
+				slog.Any(pkg.LogKeyValue, convPath))
+
+			factory := h.taskFactory
+			for _, convRule := range convPath {
+				var convTask task.Task
+				h.hookManager.HandleConversionEvent(ctx, crdName, request, convRule, func(hk *hook.Hook, info controller.BindingExecutionInfo) {
+					convTask = factory.NewHookRunTask(hk.Name, types.KubernetesConversion, info, logLabels)
+				})
+
+				if convTask == nil {
+					resultCh <- handleResult{err: fmt.Errorf("no hook found for '%s' event for crd/%s", string(types.KubernetesConversion), crdName)}
+					return
+				}
+
+				tasksMu.Lock()
+				createdTasks = append(createdTasks, convTask)
+				tasksMu.Unlock()
+
+				res := h.taskRunner(ctx, convTask)
+
+				if res.Status == "Fail" {
+					resultCh <- handleResult{response: &conversion.Response{
+						FailedMessage:    fmt.Sprintf("Hook failed to convert to %s", request.DesiredAPIVersion),
+						ConvertedObjects: nil,
+					}}
+					return
+				}
+
+				prop := convTask.GetProp("conversionResponse")
+				response, ok := prop.(*conversion.Response)
+				if !ok {
+					logEntry.Error("'conversionResponse' task prop is not of type *conversion.Response",
+						slog.String(pkg.LogKeyType, fmt.Sprintf("%T", prop)))
+					resultCh <- handleResult{err: fmt.Errorf("hook task prop error")}
+					return
+				}
+
+				// Set response objects as new objects for a next round.
+				request.Objects = response.ConvertedObjects
+
+				// Stop iterating if hook has converted all objects to a desiredAPIVersion.
+				newSourceVersions := conversion.ExtractAPIVersions(request.Objects)
+
+				if len(newSourceVersions) == 1 && newSourceVersions[0] == request.DesiredAPIVersion {
+					done = true
+					break
+				}
 			}
 
-			res := h.taskRunner(ctx, convTask)
-
-			if res.Status == "Fail" {
-				return &conversion.Response{
-					FailedMessage:    fmt.Sprintf("Hook failed to convert to %s", request.DesiredAPIVersion),
-					ConvertedObjects: nil,
-				}, nil
-			}
-
-			prop := convTask.GetProp("conversionResponse")
-			response, ok := prop.(*conversion.Response)
-			if !ok {
-				logEntry.Error("'conversionResponse' task prop is not of type *conversion.Response",
-					slog.String(pkg.LogKeyType, fmt.Sprintf("%T", prop)))
-				return nil, fmt.Errorf("hook task prop error")
-			}
-
-			// Set response objects as new objects for a next round.
-			request.Objects = response.ConvertedObjects
-
-			// Stop iterating if hook has converted all objects to a desiredAPIVersion.
-			newSourceVersions := conversion.ExtractAPIVersions(request.Objects)
-
-			if len(newSourceVersions) == 1 && newSourceVersions[0] == request.DesiredAPIVersion {
-				done = true
+			if done {
 				break
 			}
 		}
 
 		if done {
-			break
+			resultCh <- handleResult{response: &conversion.Response{
+				ConvertedObjects: request.Objects,
+			}}
+			return
 		}
-	}
 
-	if done {
-		return &conversion.Response{
-			ConvertedObjects: request.Objects,
-		}, nil
-	}
+		resultCh <- handleResult{response: &conversion.Response{
+			FailedMessage: fmt.Sprintf("Conversion %s to %s was not successful", crdName, request.DesiredAPIVersion),
+		}}
+	}()
 
-	return &conversion.Response{
-		FailedMessage: fmt.Sprintf("Conversion %s to %s was not successful", crdName, request.DesiredAPIVersion),
-	}, nil
+	select {
+	case r := <-resultCh:
+		return r.response, r.err
+	case <-ctx.Done():
+		tasksMu.Lock()
+		for _, t := range createdTasks {
+			t.FailNonRecoverable(ctx.Err())
+		}
+		tasksMu.Unlock()
+		return nil, fmt.Errorf("conversion webhook task cannot be recovered during shutdown: %w", ctx.Err())
+	}
 }

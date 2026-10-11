@@ -34,6 +34,25 @@ type Task interface {
 	SetProcessing(bool)
 	DeepCopyWithNewUUID() Task
 	GetCompactionID() string
+
+	// BirthEpoch stamps the task with the incarnation of the queue it was
+	// born in. Compaction never merges tasks from different epochs, so a
+	// compacted task restored after a restart keeps representing only the
+	// contexts it held before the restart.
+	GetBirthEpoch() int64
+	SetBirthEpoch(epoch int64)
+
+	// Recoverability. A non-recoverable task (e.g. an admission webhook task
+	// whose response can only be delivered to the live caller) must be marked
+	// explicitly at enqueue time; the queue excludes it from checkpoints and
+	// delivers a definitive failure via FailNonRecoverable when it cannot be
+	// completed before shutdown instead of silently dropping it.
+	IsRecoverable() bool
+	MarkNonRecoverable(reason string)
+	NonRecoverableReason() string
+	FailNonRecoverable(err error) bool
+	NonRecoverableDone() <-chan struct{}
+	NonRecoverableErr() error
 }
 
 type BaseTask struct {
@@ -53,6 +72,17 @@ type BaseTask struct {
 	compactionID string
 
 	processing atomic.Bool
+
+	// BirthEpoch is the incarnation of the queue in which the task was first
+	// enqueued. Zero means "not stamped yet"; the queue stamps it on enqueue.
+	BirthEpoch int64
+
+	// Recoverability state. nonRecoverable tasks are excluded from checkpoints.
+	nrMu     sync.Mutex
+	nrOnce   sync.Once
+	nrDone   chan struct{}
+	nrErr    error
+	nrReason string
 }
 
 func NewTask(taskType TaskType) *BaseTask {
@@ -79,6 +109,7 @@ func (t *BaseTask) deepCopy() *BaseTask {
 		QueueName:      t.QueueName,
 		QueuedAt:       t.QueuedAt,
 		Metadata:       t.Metadata,
+		BirthEpoch:     t.BirthEpoch,
 	}
 
 	// Deep copy LogLabels
@@ -103,6 +134,12 @@ func (t *BaseTask) DeepCopyWithNewUUID() Task {
 	newTask := t.deepCopy()
 	newTask.Id = uuid.Must(uuid.NewV4()).String()
 	newTask.LogLabels[pkg.LogKeyTaskDotID] = newTask.Id
+
+	// A copy of a non-recoverable task is its own, non-recoverable promise and
+	// therefore gets its own failure notification channel.
+	if reason := t.NonRecoverableReason(); !t.IsRecoverable() {
+		newTask.MarkNonRecoverable(reason)
+	}
 	return newTask
 }
 
@@ -223,4 +260,76 @@ func (t *BaseTask) SetProcessing(val bool) {
 
 func (t *BaseTask) IsProcessing() bool {
 	return t.processing.Load()
+}
+
+func (t *BaseTask) GetBirthEpoch() int64 {
+	return t.BirthEpoch
+}
+
+func (t *BaseTask) SetBirthEpoch(epoch int64) {
+	t.BirthEpoch = epoch
+}
+
+// IsRecoverable reports whether the task is allowed to be persisted into a
+// queue checkpoint. All tasks are recoverable until explicitly marked.
+func (t *BaseTask) IsRecoverable() bool {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrDone == nil
+}
+
+// MarkNonRecoverable explicitly declares that the task cannot be persisted and
+// replayed (e.g. it carries a synchronous admission response). It must be
+// called at task construction/enqueue time. Repeated calls update the reason.
+func (t *BaseTask) MarkNonRecoverable(reason string) {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	if t.nrDone == nil {
+		t.nrDone = make(chan struct{})
+	}
+	t.nrReason = reason
+}
+
+func (t *BaseTask) NonRecoverableReason() string {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrReason
+}
+
+// FailNonRecoverable delivers the definitive failure promised to the caller
+// of a non-recoverable task. It is idempotent and returns true only for the
+// first invocation. It is a no-op for recoverable tasks.
+func (t *BaseTask) FailNonRecoverable(err error) bool {
+	t.nrMu.Lock()
+	done := t.nrDone
+	alreadyFailed := t.nrErr != nil
+	if done != nil && err == nil {
+		err = &NonRecoverableTaskError{Reason: t.nrReason}
+	}
+	if done != nil && !alreadyFailed {
+		t.nrErr = err
+	}
+	t.nrMu.Unlock()
+
+	if done == nil || alreadyFailed {
+		return false
+	}
+	t.nrOnce.Do(func() { close(done) })
+	return true
+}
+
+// NonRecoverableDone returns a channel closed once the definitive failure for
+// a non-recoverable task is known. It returns nil for recoverable tasks.
+func (t *BaseTask) NonRecoverableDone() <-chan struct{} {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrDone
+}
+
+// NonRecoverableErr returns the definitive failure after NonRecoverableDone is
+// closed.
+func (t *BaseTask) NonRecoverableErr() error {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrErr
 }

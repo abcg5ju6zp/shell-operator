@@ -2,6 +2,8 @@ package queue
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"time"
@@ -20,6 +22,11 @@ type TaskQueueSet struct {
 	MainName string
 
 	metricStorage metricsstorage.Storage
+
+	// checkpointDir, when non-empty, enables recoverable checkpoints for every
+	// named queue created afterwards (one JSON file per queue).
+	checkpointDir      string
+	checkpointInterval time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -50,6 +57,26 @@ func (tqs *TaskQueueSet) WithMetricStorage(mstor metricsstorage.Storage) *TaskQu
 	tqs.metricStorage = mstor
 
 	return tqs
+}
+
+// WithCheckpointDir enables durable, recoverable checkpoints: each named
+// queue gets a JSON file inside dir and is restored from its last complete
+// generation when created. Call before NewNamedQueue.
+func (tqs *TaskQueueSet) WithCheckpointDir(dir string) *TaskQueueSet {
+	tqs.checkpointDir = dir
+	return tqs
+}
+
+// WithCheckpointFlushInterval overrides the coalescing window for asynchronous
+// checkpoint writes in every durable queue created afterwards.
+func (tqs *TaskQueueSet) WithCheckpointFlushInterval(interval time.Duration) *TaskQueueSet {
+	tqs.checkpointInterval = interval
+	return tqs
+}
+
+// CheckpointDir returns the configured checkpoint directory (may be empty).
+func (tqs *TaskQueueSet) CheckpointDir() string {
+	return tqs.checkpointDir
 }
 
 func (tqs *TaskQueueSet) WithLogger(logger *log.Logger) *TaskQueueSet {
@@ -88,23 +115,41 @@ func (tqs *TaskQueueSet) Add(queue *TaskQueue) {
 	tqs.Queues.Set(queue.Name, queue)
 }
 
-func (tqs *TaskQueueSet) NewNamedQueue(name string, handler func(ctx context.Context, t task.Task) TaskResult, opts ...TaskQueueOption) {
+// NewNamedQueue creates a queue, restores its last checkpoint when durable
+// persistence is configured and registers it. A corrupt or unreadable
+// checkpoint is preserved on disk and returned as an error; the queue is kept
+// registered but will not start, so callers must not ignore the error.
+func (tqs *TaskQueueSet) NewNamedQueue(name string, handler func(ctx context.Context, t task.Task) TaskResult, opts ...TaskQueueOption) error {
+	allOpts := make([]TaskQueueOption, 0, len(opts)+2)
+	allOpts = append(allOpts, WithHandler(handler), WithContext(tqs.ctx))
+	if tqs.checkpointDir != "" {
+		allOpts = append(allOpts, WithCheckpointDir(tqs.checkpointDir))
+	}
+	if tqs.checkpointInterval > 0 {
+		allOpts = append(allOpts, WithCheckpointFlushInterval(tqs.checkpointInterval))
+	}
+	allOpts = append(allOpts, opts...)
+
 	q := NewTasksQueue(
 		name,
 		tqs.metricStorage,
-		WithHandler(handler),
-		WithContext(tqs.ctx),
+		allOpts...,
 	)
-
-	for _, opt := range opts {
-		opt(q)
-	}
 
 	if q.logger == nil {
 		q.logger = log.NewLogger().Named("task_queue")
 	}
 
+	if err := q.InitPersistence(tqs.ctx); err != nil {
+		tqs.logger.Error("failed to restore queue from checkpoint; queue is stopped",
+			slog.String(pkg.LogKeyQueue, name),
+			slog.Any(pkg.LogKeyError, err))
+		tqs.Queues.Set(q.Name, q)
+		return err
+	}
+
 	tqs.Queues.Set(q.Name, q)
+	return nil
 }
 
 func (tqs *TaskQueueSet) GetByName(name string) *TaskQueue {
@@ -243,25 +288,64 @@ func (tqs *TaskQueueSet) WaitStopWithTimeout(timeout time.Duration) {
 	}
 }
 
-// Shutdown stops every queue in the set and blocks until either all workers
-// reach QueueStatusStop or ctx is canceled / deadlines. Returns ctx.Err() on
-// timeout and nil on a clean stop. Safe to call once; calling it on an
-// already-stopped set is a no-op.
+// Shutdown gracefully stops every queue and persists the recoverable
+// boundary of each durable queue.
+//
+// Sequence:
+//  1. Every queue stops accepting new tasks; pending non-recoverable tasks
+//     get a definitive failure; worker contexts are canceled.
+//  2. Wait (bounded by ctx) until workers reach QueueStatusStop.
+//  3. Each durable queue writes its final complete checkpoint generation,
+//     with claimed-but-unfinished tasks left at their original position.
+//
+// Returns ctx.Err() on drain timeout (checkpoint persistence is still
+// attempted with a background-bound context) joined with persistence errors.
 func (tqs *TaskQueueSet) Shutdown(ctx context.Context) error {
 	if tqs.cancel != nil {
 		tqs.cancel()
 	}
 
+	for _, q := range tqs.Queues.List() {
+		q.BeginShutdown()
+	}
+
+	drainErr := tqs.waitStopped(ctx)
+
+	// Persist even if draining hit the deadline: the process is going down
+	// either way, and a flushed boundary is better than nothing.
+	persistCtx := ctx
+	if drainErr != nil {
+		var cancel context.CancelFunc
+		persistCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+
+	var errs []error
+	if drainErr != nil {
+		errs = append(errs, drainErr)
+	}
+	for _, q := range tqs.Queues.List() {
+		if err := q.PersistShutdownBoundary(persistCtx); err != nil {
+			errs = append(errs, fmt.Errorf("persist queue %q checkpoint: %w", q.Name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// waitStopped polls until every queue reached QueueStatusStop or ctx expires.
+// Queues whose worker was never started are treated as stopped.
+func (tqs *TaskQueueSet) waitStopped(ctx context.Context) error {
 	checkTick := time.NewTicker(50 * time.Millisecond)
 	defer checkTick.Stop()
 
 	for {
 		stopped := true
 		for _, q := range tqs.Queues.List() {
-			if q.GetStatusType() != QueueStatusStop {
-				stopped = false
-				break
+			if q.GetStatusType() == QueueStatusStop || !q.started.Load() {
+				continue
 			}
+			stopped = false
+			break
 		}
 		if stopped {
 			return nil

@@ -204,9 +204,19 @@ func (op *ShellOperator) Start(_ context.Context) error {
 		}
 
 		if op.TaskQueues != nil {
-			op.bootstrapMainQueue(op.TaskQueues)
+			if err := op.bootstrapMainQueue(op.TaskQueues); err != nil {
+				op.startErr = err
+				op.logger.Error("cannot initialize main task queue",
+					slog.Any(pkg.LogKeyError, err))
+				return
+			}
 			op.TaskQueues.StartMain(op.ctx)
-			op.initAndStartHookQueues()
+			if err := op.initAndStartHookQueues(); err != nil {
+				op.startErr = err
+				op.logger.Error("cannot initialize hook task queues",
+					slog.Any(pkg.LogKeyError, err))
+				return
+			}
 		}
 
 		// Start emit "live" metrics. Goroutines tracked via op.wg so Shutdown
@@ -838,7 +848,7 @@ func (op *ShellOperator) CombineBindingContextForHook(q *queue.TaskQueue, t task
 		nextHookName := hm.(task_metadata.HookNameAccessor).GetHookName()
 		// Only tasks for the same hook and of the same type can be combined (HookRun cannot be combined with OnStartup).
 		// Using stopCombineFn function stricter combine rules can be defined.
-		if nextHookName == hookName && t.GetType() == tsk.GetType() {
+		if nextHookName == hookName && t.GetType() == tsk.GetType() && tsk.GetBirthEpoch() == t.GetBirthEpoch() {
 			if stopCombineFn != nil {
 				stopIterate = stopCombineFn(tsk)
 			}
@@ -913,26 +923,102 @@ func (op *ShellOperator) CombineBindingContextForHook(q *queue.TaskQueue, t task
 	return res
 }
 
-// bootstrapMainQueue adds tasks to run hooks with OnStartup bindings
-// and tasks to enable kubernetes bindings.
-func (op *ShellOperator) bootstrapMainQueue(tqs *queue.TaskQueueSet) {
+// bootstrapSeedKey identifies a single initial-seeding entry (an OnStartup
+// task or an Enable*Bindings task for one hook). The set of issued keys is
+// checkpointed to prevent duplicate seeding without starving hooks added after
+// a restart.
+func bootstrapSeedKey(kind, hookName string) string {
+	return kind + ":" + hookName
+}
+
+// seedEntry is one initial main-queue task in canonical seeding order.
+type seedEntry struct {
+	key  string
+	task task.Task
+}
+
+// bootstrapMainQueue creates the main queue, restores its checkpoint when
+// durable persistence is configured and seeds initial tasks:
+//
+//   - On a fresh start (or a crash before seeding was checkpointed) all
+//     OnStartup and Enable*Bindings tasks are appended as before.
+//   - On recovery from a bootstrapped checkpoint, previously issued seeding
+//     entries are not replayed; only hooks introduced by the new configuration
+//     are seeded, inserted at the head so monitors converge before restored
+//     pending events are processed.
+func (op *ShellOperator) bootstrapMainQueue(tqs *queue.TaskQueueSet) error {
 	logEntry := op.logger.With(pkg.LogKeyOperatorComponent, "initMainQueue")
 
-	// Prepopulate main queue with 'onStartup' tasks and 'enable kubernetes bindings' tasks.
+	// Create the main queue (restores the last complete checkpoint, if any).
 	tqs.WithMainName("main")
-	tqs.NewNamedQueue("main",
+	if err := tqs.NewNamedQueue("main",
 		op.taskHandler,
 		queue.WithCompactableTypes(task_metadata.HookRun),
 		queue.WithLogger(op.logger.With(pkg.LogKeyOperatorComponent, "mainQueue")),
-	)
+	); err != nil {
+		return fmt.Errorf("create main queue: %w", err)
+	}
 
 	mainQueue := tqs.GetMain()
 
-	// Add tasks to run OnStartup bindings
+	entries, err := op.buildBootstrapSeedEntries()
+	if err != nil {
+		return err
+	}
+
+	allKeys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		allKeys = append(allKeys, e.key)
+	}
+
+	switch {
+	case mainQueue.WasRestored() && mainQueue.IsBootstrapped():
+		// Replay nothing that was already seeded; only seed what the current
+		// hook configuration adds on top of the checkpointed generation.
+		missing := make([]task.Task, 0)
+		for _, e := range entries {
+			if mainQueue.IsSeeded(e.key) {
+				continue
+			}
+			missing = append(missing, e.task)
+			logEntry.Info("queue initial task for newly configured hook",
+				slog.String(pkg.LogKeyTask, e.task.GetDescription()))
+		}
+		if len(missing) > 0 {
+			// AddFirst preserves the canonical order at the head, ahead of
+			// restored pending tasks.
+			mainQueue.AddFirst(missing...)
+		} else {
+			logEntry.Info("main queue restored from checkpoint, initial seeding already complete",
+				slog.Int(pkg.LogKeyTasksCount, mainQueue.Length()))
+		}
+	default:
+		// Fresh start (or crash before the seeded set was persisted): full seed.
+		for _, e := range entries {
+			mainQueue.AddLast(e.task)
+			logEntry.Info("queue task with hook",
+				slog.String(pkg.LogKeyTask, e.task.GetDescription()))
+		}
+	}
+
+	mainQueue.MarkSeeded(allKeys...)
+	// Seeding is complete: remember it in the durable generation so a restart
+	// never duplicates OnStartup and Enable*Bindings tasks.
+	mainQueue.MarkBootstrapped()
+
+	return nil
+}
+
+// buildBootstrapSeedEntries constructs the canonical initial main-queue tasks:
+// OnStartup hooks (in execution order), then Enable*Bindings tasks per hook.
+func (op *ShellOperator) buildBootstrapSeedEntries() ([]seedEntry, error) {
+	entries := make([]seedEntry, 0)
+
 	onStartupHooks, err := op.HookManager.GetHooksInOrder(types.OnStartup)
 	if err != nil {
-		logEntry.Error("add tasks to run OnStartup bindings", log.Err(err))
-		return
+		op.logger.With(pkg.LogKeyOperatorComponent, "initMainQueue").
+			Error("add tasks to run OnStartup bindings", log.Err(err))
+		return nil, fmt.Errorf("get onStartup hooks: %w", err)
 	}
 
 	for _, hookName := range onStartupHooks {
@@ -950,10 +1036,10 @@ func (op *ShellOperator) bootstrapMainQueue(tqs *queue.TaskQueueSet) {
 			WithCompactionID(hookName).
 			WithQueuedAt(time.Now())
 
-		mainQueue.AddLast(newTask)
-		logEntry.Info("queue task with hook",
-			slog.String(pkg.LogKeyTask, newTask.GetDescription()),
-			slog.String(pkg.LogKeyHook, hookName))
+		entries = append(entries, seedEntry{
+			key:  bootstrapSeedKey("onStartup", hookName),
+			task: newTask,
+		})
 	}
 
 	// Add tasks to enable kubernetes monitors and schedules for each hook
@@ -968,10 +1054,10 @@ func (op *ShellOperator) bootstrapMainQueue(tqs *queue.TaskQueueSet) {
 				}).
 				WithCompactionID(hookName).
 				WithQueuedAt(time.Now())
-			mainQueue.AddLast(newTask)
-			logEntry.Info("queue task with hook",
-				slog.String(pkg.LogKeyTask, newTask.GetDescription()),
-				slog.String(pkg.LogKeyHook, hookName))
+			entries = append(entries, seedEntry{
+				key:  bootstrapSeedKey("enableKubernetes", hookName),
+				task: newTask,
+			})
 		}
 
 		if h.GetConfig().HasBinding(types.Schedule) {
@@ -982,12 +1068,14 @@ func (op *ShellOperator) bootstrapMainQueue(tqs *queue.TaskQueueSet) {
 				}).
 				WithCompactionID(hookName).
 				WithQueuedAt(time.Now())
-			mainQueue.AddLast(newTask)
-			logEntry.Info("queue task with hook",
-				slog.String(pkg.LogKeyTask, newTask.GetDescription()),
-				slog.String(pkg.LogKeyHook, hookName))
+			entries = append(entries, seedEntry{
+				key:  bootstrapSeedKey("enableSchedule", hookName),
+				task: newTask,
+			})
 		}
 	}
+
+	return entries, nil
 }
 
 // runMetrics spawns two long-running metric goroutines. Both honor op.ctx and
@@ -1039,18 +1127,20 @@ func (op *ShellOperator) runQueueLengthMetric() {
 	}
 }
 
-// initAndStartHookQueues create all queues defined in hooks
-func (op *ShellOperator) initAndStartHookQueues() {
+// initAndStartHookQueues create all queues defined in hooks.
+func (op *ShellOperator) initAndStartHookQueues() error {
 	schHooks, _ := op.HookManager.GetHooksInOrder(types.Schedule)
 	for _, hookName := range schHooks {
 		h := op.HookManager.GetHook(hookName)
 		for _, hookBinding := range h.Config.Schedules {
 			if op.TaskQueues.GetByName(hookBinding.Queue) == nil {
-				op.TaskQueues.NewNamedQueue(hookBinding.Queue,
+				if err := op.TaskQueues.NewNamedQueue(hookBinding.Queue,
 					op.taskHandler,
 					queue.WithCompactableTypes(task_metadata.HookRun),
 					queue.WithLogger(op.logger.With(pkg.LogKeyOperatorComponent, "hookQueue", pkg.LogKeyHook, hookName, pkg.LogKeyQueue, hookBinding.Queue)),
-				)
+				); err != nil {
+					return fmt.Errorf("create schedule queue %q: %w", hookBinding.Queue, err)
+				}
 				op.TaskQueues.GetByName(hookBinding.Queue).Start(op.ctx)
 			}
 		}
@@ -1061,13 +1151,16 @@ func (op *ShellOperator) initAndStartHookQueues() {
 		h := op.HookManager.GetHook(hookName)
 		for _, hookBinding := range h.Config.OnKubernetesEvents {
 			if op.TaskQueues.GetByName(hookBinding.Queue) == nil {
-				op.TaskQueues.NewNamedQueue(hookBinding.Queue,
+				if err := op.TaskQueues.NewNamedQueue(hookBinding.Queue,
 					op.taskHandler,
 					queue.WithCompactableTypes(task_metadata.HookRun),
 					queue.WithLogger(op.logger.With(pkg.LogKeyOperatorComponent, "hookQueue", pkg.LogKeyHook, hookName, pkg.LogKeyQueue, hookBinding.Queue)),
-				)
+				); err != nil {
+					return fmt.Errorf("create kubernetes queue %q: %w", hookBinding.Queue, err)
+				}
 				op.TaskQueues.GetByName(hookBinding.Queue).Start(op.ctx)
 			}
 		}
 	}
+	return nil
 }

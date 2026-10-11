@@ -2,6 +2,7 @@ package queue
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,13 @@ type mockTask struct {
 	Metadata interface{}
 
 	processing atomic.Bool
+
+	BirthEpochV int64
+
+	nrMu     sync.Mutex
+	nrDone   chan struct{}
+	nrErr    error
+	nrReason string
 }
 
 func newMockTask(id, hookName string, taskType task.TaskType) *mockTask {
@@ -178,6 +186,63 @@ func (t *mockTask) DeepCopyWithNewUUID() task.Task {
 
 func (t *mockTask) GetCompactionID() string {
 	return t.Id
+}
+
+func (t *mockTask) GetBirthEpoch() int64 {
+	return t.BirthEpochV
+}
+
+func (t *mockTask) SetBirthEpoch(epoch int64) {
+	t.BirthEpochV = epoch
+}
+
+func (t *mockTask) IsRecoverable() bool {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrDone == nil
+}
+
+func (t *mockTask) MarkNonRecoverable(reason string) {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	if t.nrDone == nil {
+		t.nrDone = make(chan struct{})
+	}
+	t.nrReason = reason
+}
+
+func (t *mockTask) NonRecoverableReason() string {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrReason
+}
+
+func (t *mockTask) FailNonRecoverable(err error) bool {
+	t.nrMu.Lock()
+	if t.nrDone == nil || t.nrErr != nil {
+		t.nrMu.Unlock()
+		return false
+	}
+	if err == nil {
+		err = fmt.Errorf("non-recoverable task %s lost", t.Id)
+	}
+	t.nrErr = err
+	done := t.nrDone
+	t.nrMu.Unlock()
+	close(done)
+	return true
+}
+
+func (t *mockTask) NonRecoverableDone() <-chan struct{} {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrDone
+}
+
+func (t *mockTask) NonRecoverableErr() error {
+	t.nrMu.Lock()
+	defer t.nrMu.Unlock()
+	return t.nrErr
 }
 
 // newTestMetricStorage creates a metric storage mock with all required methods stubbed

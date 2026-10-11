@@ -3,6 +3,7 @@ package shell_operator
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/deckhouse/deckhouse/pkg/log"
 
@@ -244,6 +245,13 @@ func (op *ShellOperator) assembleShellOperator(cfg *app.Config, hooksDir string,
 
 	// Create webhookManagers with dependencies.
 	op.setupHookManagers(cfg, hooksDir, tempDir)
+
+	// Enable durable, recoverable task queue checkpoints under the runtime
+	// directory. Queues are created later (Start), so this only configures the
+	// set. Empty tempDir keeps persistence disabled.
+	if op.TaskQueues != nil && tempDir != "" {
+		op.TaskQueues.WithCheckpointDir(filepath.Join(tempDir, "task-queues"))
+	}
 
 	// Register the three built-in task type handlers. Extenders may add more
 	// handlers via op.taskHandlerRegistry.Register() after this call.

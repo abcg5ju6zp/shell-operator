@@ -79,6 +79,17 @@ func (t *mockTaskBench) GetCompactionID() string {
 	return t.Id
 }
 
+func (t *mockTaskBench) GetBirthEpoch() int64             { return 0 }
+func (t *mockTaskBench) SetBirthEpoch(_ int64)           {}
+func (t *mockTaskBench) IsRecoverable() bool             { return true }
+func (t *mockTaskBench) MarkNonRecoverable(_ string)     {}
+func (t *mockTaskBench) NonRecoverableReason() string    { return "" }
+func (t *mockTaskBench) FailNonRecoverable(_ error) bool { return false }
+func (t *mockTaskBench) NonRecoverableDone() <-chan struct{} {
+	return nil
+}
+func (t *mockTaskBench) NonRecoverableErr() error { return nil }
+
 type Queue interface {
 	AddLast(tasks ...task.Task)
 	AddFirst(tasks ...task.Task)

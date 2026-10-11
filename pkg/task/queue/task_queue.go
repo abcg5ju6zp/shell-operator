@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,12 @@ This implementation uses container/list for O(1) queue operations and a map for 
 const (
 	compactionThreshold             = 100
 	metricsMonitoringUpdateInterval = 10 * time.Second
+
+	// DefaultCheckpointFlushInterval bounds how long an enqueued task exists
+	// only in memory before a new checkpoint generation is durable. Claim and
+	// result points always flush synchronously, and zero makes enqueue writes
+	// synchronous too (writer goroutine still coalesces concurrent bursts).
+	DefaultCheckpointFlushInterval = 0
 )
 
 var (
@@ -134,6 +141,42 @@ type TaskQueue struct {
 	contextBuffer   []bindingcontext.BindingContext
 	monitorIDBuffer []string
 	groupBuffer     map[string]*compactionGroup
+
+	// Recoverable checkpoints. nil store means a pure in-memory queue (tests,
+	// embedders that do not configure persistence); every checkpoint hook is a
+	// no-op in that case.
+	cpStore         CheckpointStore
+	cpWriter        *checkpointWriter
+	cpFlushInterval time.Duration
+
+	// accepting is false after BeginShutdown or once a terminal checkpoint
+	// failure occurred: the queue then stops acknowledging new tasks.
+	accepting atomic.Bool
+
+	// epoch is the queue incarnation: 0 until persistence is initialized,
+	// then 1 on a fresh start and restoredGeneration+1 after recovery.
+	epoch int64
+	// cpGeneration is the number of the last built snapshot generation.
+	cpGeneration int64
+	// bootstrapped is persisted so a restart does not re-seed initial tasks.
+	bootstrapped bool
+	// seededKeys records which initial-seeding entries (onStartup/Enable* for a
+	// hook) were already issued, so a restart seeds only newly added hooks.
+	seededKeys map[string]struct{}
+	// restored is true when tasks were loaded from a checkpoint file.
+	restored bool
+	// restoreErr is set when the checkpoint file is corrupt/unreadable.
+	restoreErr error
+
+	// cpFailOnce guards terminal checkpoint-failure handling.
+	cpFailOnce sync.Once
+	cpErr      error
+
+	// Non-recoverable tasks currently held by the queue (pending or claimed).
+	// They are excluded from checkpoints and receive a definitive failure
+	// when the queue stops accepting before they complete.
+	nonRecoverableMu sync.Mutex
+	nonRecoverable   map[string]task.Task
 }
 
 // TaskQueueOption defines a functional option for TaskQueue configuration
@@ -176,6 +219,43 @@ func WithLogger(logger *log.Logger) TaskQueueOption {
 	}
 }
 
+// WithCheckpointStore enables recoverable checkpoints backed by store. The
+// store is read (recovery) when the queue is initialized via
+// InitPersistence (TaskQueueSet does this for every named queue).
+func WithCheckpointStore(store CheckpointStore) TaskQueueOption {
+	return func(q *TaskQueue) {
+		q.cpStore = store
+	}
+}
+
+// WithCheckpointDir enables recoverable checkpoints stored as one JSON file
+// per queue inside dir. The directory is created if missing.
+func WithCheckpointDir(dir string) TaskQueueOption {
+	return func(q *TaskQueue) {
+		if dir == "" {
+			return
+		}
+		store, err := NewFileCheckpointStore(dir, q.Name)
+		if err != nil {
+			q.logger.Error("cannot initialize checkpoint store",
+				slog.String(pkg.LogKeyQueue, q.Name),
+				slog.String(pkg.LogKeyDir, dir),
+				slog.Any(pkg.LogKeyError, err))
+			return
+		}
+		q.cpStore = store
+	}
+}
+
+// WithCheckpointFlushInterval overrides the coalescing window for asynchronous
+// checkpoint writes. Zero (default) makes every enqueue durable before the
+// mutating call proceeds; claim and result points always flush regardless.
+func WithCheckpointFlushInterval(interval time.Duration) TaskQueueOption {
+	return func(q *TaskQueue) {
+		q.cpFlushInterval = interval
+	}
+}
+
 // NewTasksQueue creates a new TaskQueue with the provided options
 func NewTasksQueue(name string, metricStorage metricsstorage.Storage, opts ...TaskQueueOption) *TaskQueue {
 	q := &TaskQueue{
@@ -195,7 +275,11 @@ func NewTasksQueue(name string, metricStorage metricsstorage.Storage, opts ...Ta
 		groupBuffer:     make(map[string]*compactionGroup, 32),
 		metricStorage:   metricStorage,
 		status:          NewTaskQueueStatus(),
+		cpFlushInterval: DefaultCheckpointFlushInterval,
+		nonRecoverable:  make(map[string]task.Task),
+		seededKeys:      make(map[string]struct{}),
 	}
+	q.accepting.Store(true)
 
 	// Apply all options
 	for _, opt := range opts {
@@ -295,12 +379,25 @@ func (q *TaskQueue) Length() int {
 func (q *TaskQueue) AddFirst(tasks ...task.Task) {
 	defer q.MeasureActionTime("AddFirst")()
 
-	q.storage.AddFirst(tasks...)
+	accepted := make([]task.Task, 0, len(tasks))
+	for _, t := range tasks {
+		if !q.admitTask(t) {
+			continue
+		}
+		accepted = append(accepted, t)
+	}
+	if len(accepted) == 0 {
+		return
+	}
+
+	q.storage.AddFirst(accepted...)
 
 	// Update queueTasksCounter for each added task
-	for _, t := range tasks {
+	for _, t := range accepted {
 		q.queueTasksCounter.Add(t)
 	}
+
+	q.checkpointRecord()
 }
 
 // RemoveFirst deletes a head element, so head is moved.
@@ -310,6 +407,8 @@ func (q *TaskQueue) RemoveFirst() task.Task {
 	t := q.storage.RemoveFirst()
 	if t != nil {
 		q.queueTasksCounter.Remove(t)
+		q.untrackNonRecoverable(t)
+		q.checkpointRecord()
 	}
 
 	return t
@@ -328,6 +427,10 @@ func (q *TaskQueue) AddLast(tasks ...task.Task) {
 	defer q.MeasureActionTime("AddLast")()
 
 	for _, t := range tasks {
+		if !q.admitTask(t) {
+			continue
+		}
+
 		q.lazydebug("adding task to queue", func() []any {
 			return []any{
 				slog.String(pkg.LogKeyQueue, q.Name),
@@ -389,6 +492,10 @@ func (q *TaskQueue) AddLast(tasks ...task.Task) {
 				}
 			})
 		}
+
+		// The task is in the queue and any compaction is done: persist the
+		// enqueue boundary.
+		q.checkpointRecord()
 	}
 }
 
@@ -448,7 +555,15 @@ func (q *TaskQueue) compaction(compactionIDs map[string]struct{}) {
 		bindingContext := bindingContextAcessor.GetBindingContext()
 		monitorIDs := monitorIDsAcessor.GetMonitorIDs()
 
-		if group, exists := hookGroups[hookName]; exists {
+		// Tasks are grouped per hook AND per birth epoch. After a restart,
+		// restored tasks carry the old epoch while new events carry the next
+		// one: compaction never merges contexts across that generation
+		// boundary, so a compacted task keeps representing only the original
+		// contexts. On a fresh start all tasks share epoch 0/1 and behavior is
+		// unchanged.
+		groupKey := compactionGroupKey(hookName, t.GetBirthEpoch())
+
+		if group, exists := hookGroups[groupKey]; exists {
 			// Add to existing group
 			group.elementsToMerge = append(group.elementsToMerge, e)
 			group.totalContexts += len(bindingContext)
@@ -459,18 +574,24 @@ func (q *TaskQueue) compaction(compactionIDs map[string]struct{}) {
 			group.targetElement = e
 			group.totalContexts = len(bindingContext)
 			group.totalMonitorIDs = len(monitorIDs)
-			hookGroups[hookName] = group
+			hookGroups[groupKey] = group
 		}
 	})
 
 	// Second pass: merge with pooled slices
-	for hookName, group := range hookGroups {
+	for groupKey, group := range hookGroups {
 		if len(group.elementsToMerge) == 0 {
 			continue
 		}
 
 		targetTask := group.targetElement.Value
 		targetMetadata := targetTask.GetMetadata()
+
+		// The map key carries the birth epoch; labels need just the hook name.
+		hookName, _ := parseCompactionGroupKey(groupKey)
+		if accessor, ok := targetMetadata.(task_metadata.HookNameAccessor); ok {
+			hookName = accessor.GetHookName()
+		}
 
 		// Get slices from pools
 		newContexts := q.getContextSlice()
@@ -522,6 +643,7 @@ func (q *TaskQueue) compaction(compactionIDs map[string]struct{}) {
 
 			q.storage.RemoveElement(elementToMerge)
 			q.queueTasksCounter.Remove(taskToMerge)
+			q.untrackNonRecoverable(taskToMerge)
 		}
 
 		// Update target task with compacted slices
@@ -566,6 +688,24 @@ func (q *TaskQueue) compaction(compactionIDs map[string]struct{}) {
 	}
 
 	q.queueTasksCounter.ResetReachedCap()
+
+	// Contexts were merged into surviving tasks: persist the new compaction
+	// result so a crash never re-splits or replays it differently.
+	q.checkpointSubmit()
+}
+
+// compactionGroupKey combines the hook name (compaction grouping) with the
+// task's birth epoch to separate pre- and post-restart contexts.
+func compactionGroupKey(hookName string, birthEpoch int64) string {
+	return hookName + "|e" + strconv.FormatInt(birthEpoch, 10)
+}
+
+func parseCompactionGroupKey(key string) (hookName string, epoch string) {
+	idx := strings.LastIndex(key, "|e")
+	if idx < 0 {
+		return key, ""
+	}
+	return key[:idx], key[idx+2:]
 }
 
 // compactBindingContexts mimics the logic from shell-operator's CombineBindingContextForHook.
@@ -633,6 +773,8 @@ func (q *TaskQueue) RemoveLast() task.Task {
 	t := q.storage.RemoveLast()
 	if t != nil {
 		q.queueTasksCounter.Remove(t)
+		q.untrackNonRecoverable(t)
+		q.checkpointRecord()
 	}
 
 	return t
@@ -654,20 +796,38 @@ func (q *TaskQueue) Get(id string) task.Task {
 func (q *TaskQueue) AddAfter(id string, tasks ...task.Task) {
 	defer q.MeasureActionTime("AddAfter")()
 
-	q.storage.AddAfter(id, tasks...)
+	accepted := make([]task.Task, 0, len(tasks))
+	for _, t := range tasks {
+		if q.admitTask(t) {
+			accepted = append(accepted, t)
+		}
+	}
+	if len(accepted) == 0 {
+		return
+	}
+
+	q.storage.AddAfter(id, accepted...)
 
 	// Update queueTasksCounter for each added task
-	for _, t := range tasks {
+	for _, t := range accepted {
 		q.queueTasksCounter.Add(t)
 	}
+
+	q.checkpointRecord()
 }
 
 // AddBefore inserts a task before the task with specified id.
 func (q *TaskQueue) AddBefore(id string, newTask task.Task) {
 	defer q.MeasureActionTime("AddBefore")()
 
+	if !q.admitTask(newTask) {
+		return
+	}
+
 	q.storage.AddBefore(id, newTask)
 	q.queueTasksCounter.Add(newTask)
+
+	q.checkpointRecord()
 }
 
 // Remove finds element by id and deletes it.
@@ -677,6 +837,8 @@ func (q *TaskQueue) Remove(id string) task.Task {
 	t := q.storage.Remove(id)
 	if t != nil {
 		q.queueTasksCounter.Remove(t)
+		q.untrackNonRecoverable(t)
+		q.checkpointRecord()
 	}
 
 	return t
@@ -758,6 +920,14 @@ func (q *TaskQueue) Start(ctx context.Context) {
 		return
 	}
 
+	if q.restoreErr != nil {
+		q.logger.Error("refusing to start queue: checkpoint recovery failed",
+			slog.String(pkg.LogKeyQueue, q.Name),
+			slog.Any(pkg.LogKeyError, q.restoreErr))
+		q.SetStatus(QueueStatusStop)
+		return
+	}
+
 	if q.Handler == nil {
 		log.Error("should set handler before start in queue", slog.String(pkg.LogKeyName, q.Name))
 		q.SetStatus(QueueStatusNoHandlerSet)
@@ -835,6 +1005,11 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 				nextSleepDelay = q.ExponentialBackoffFn(t.GetFailureCount())
 				q.SetStatus(QueueStatusIdle)
 				q.SetStatusText(fmt.Sprintf("sleep after panic for %s", nextSleepDelay.String()))
+
+				// Keep the recoverable boundary consistent: the claim is
+				// released and the failure count is recorded.
+				q.checkpointSubmit()
+				q.checkpointFlushContext(ctx)
 			}
 		}()
 
@@ -854,6 +1029,12 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 
 		// set that current task is being processed, so we don't merge it with other tasks
 		t.SetProcessing(true)
+
+		// Record the claim durably before the handler runs. A crash now re-runs
+		// the task from its original position: it is still in the checkpoint at
+		// that position, just without a completion record.
+		q.checkpointSubmit()
+		q.checkpointFlushContext(ctx)
 
 		q.lazydebug("queue tasks after wait", func() []any {
 			return []any{
@@ -892,6 +1073,14 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 				t.SetProcessing(false) // release processing flag
 			})
 
+			// Completion is an acknowledgement boundary: the completed task is
+			// gone from the checkpoint (never replayed) and produced tasks are
+			// recorded before the loop continues.
+			q.untrackNonRecoverable(t)
+			q.trackResultTasks(taskRes)
+			q.checkpointSubmit()
+			q.checkpointFlushContext(ctx)
+
 			q.SetStatus(QueueStatusIdle)
 		case Fail:
 			if len(taskRes.GetAfterTasks()) > 0 || len(taskRes.GetHeadTasks()) > 0 || len(taskRes.GetTailTasks()) > 0 {
@@ -906,6 +1095,11 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 			nextSleepDelay = q.ExponentialBackoffFn(t.GetFailureCount())
 			t.IncrementFailureCount()
 			q.SetStatusText(fmt.Sprintf("sleep after fail for %s", nextSleepDelay.String()))
+
+			// Failed task stays at the head and is retried: record the claim
+			// release and failure count.
+			q.checkpointSubmit()
+			q.checkpointFlushContext(ctx)
 		case Repeat:
 			if len(taskRes.GetAfterTasks()) > 0 || len(taskRes.GetHeadTasks()) > 0 || len(taskRes.GetTailTasks()) > 0 {
 				q.logger.Warn("result is repeat, cannot process tasks in result",
@@ -918,6 +1112,12 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 			t.SetProcessing(false)
 			nextSleepDelay = q.DelayOnRepeat
 			q.SetStatus(QueueStatusRepeatTask)
+
+			// Repeat leaves the task at the head: persist its released claim so
+			// a crash re-runs it from position rather than treating it as
+			// in-flight forever.
+			q.checkpointSubmit()
+			q.checkpointFlushContext(ctx)
 		}
 
 		if taskRes.DelayBeforeNextTask != 0 {
@@ -1089,14 +1289,20 @@ func (q *TaskQueue) DeleteFunc(fn func(task.Task) bool) {
 
 	defer q.MeasureActionTime("DeleteFunc")()
 
+	mutated := false
 	q.storage.DeleteFunc(func(t task.Task) bool {
 		if !fn(t) {
 			q.queueTasksCounter.Remove(t)
+			q.untrackNonRecoverable(t)
+			mutated = true
 			return false
 		}
 
 		return true
 	})
+	if mutated {
+		q.checkpointRecord()
+	}
 }
 
 // TODO define mapping method with QueueAction to insert, modify and delete tasks.

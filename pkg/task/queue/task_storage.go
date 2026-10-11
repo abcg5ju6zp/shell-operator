@@ -12,6 +12,11 @@ type TaskStorage struct {
 	mu      sync.RWMutex
 	items   *list.List[task.Task]
 	idIndex map[string]*list.Element[task.Task]
+
+	// epoch stamps every newly added task with the queue incarnation it was
+	// born in. Zero disables stamping (restored tasks are inserted via
+	// ReplaceAll and keep their persisted epoch).
+	epoch int64
 }
 
 // newTaskStorage creates a new TaskStorage instance
@@ -22,12 +27,42 @@ func newTaskStorage() *TaskStorage {
 	}
 }
 
+// setEpoch sets the birth epoch stamped on every newly added task.
+func (ts *TaskStorage) setEpoch(epoch int64) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.epoch = epoch
+}
+
+// stampBirthEpoch marks a task as born in the current queue incarnation.
+// Tasks that already carry an epoch (moved tasks, restored tasks) keep it.
+func (ts *TaskStorage) stampBirthEpoch(t task.Task) {
+	if ts.epoch > 0 && t.GetBirthEpoch() == 0 {
+		t.SetBirthEpoch(ts.epoch)
+	}
+}
+
+// ReplaceAll replaces the whole queue content. It is used to restore tasks
+// from a checkpoint and never stamps epochs: restored tasks keep theirs.
+func (ts *TaskStorage) ReplaceAll(tasks []task.Task) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	ts.items = list.New[task.Task]()
+	ts.idIndex = make(map[string]*list.Element[task.Task], len(tasks))
+	for _, t := range tasks {
+		element := ts.items.PushBack(t)
+		ts.idIndex[t.GetId()] = element
+	}
+}
+
 // Private methods (without locking)
 
 // addFirst adds tasks to the front of the queue (internal implementation)
 func (ts *TaskStorage) addFirst(tasks ...task.Task) {
 	// Add tasks in reverse order so the first task becomes the new head
 	for i := len(tasks) - 1; i >= 0; i-- {
+		ts.stampBirthEpoch(tasks[i])
 		element := ts.items.PushFront(tasks[i])
 		ts.idIndex[tasks[i].GetId()] = element
 	}
@@ -47,6 +82,7 @@ func (ts *TaskStorage) removeFirst() task.Task {
 // addLast adds tasks to the back of the queue (internal implementation)
 func (ts *TaskStorage) addLast(tasks ...task.Task) {
 	for _, t := range tasks {
+		ts.stampBirthEpoch(t)
 		element := ts.items.PushBack(t)
 		ts.idIndex[t.GetId()] = element
 	}
@@ -68,6 +104,7 @@ func (ts *TaskStorage) addAfter(id string, tasks ...task.Task) {
 	if element, ok := ts.idIndex[id]; ok {
 		// Insert tasks in reverse order so they appear in the correct sequence
 		for i := len(tasks) - 1; i >= 0; i-- {
+			ts.stampBirthEpoch(tasks[i])
 			newElement := ts.items.InsertAfter(tasks[i], element)
 			ts.idIndex[tasks[i].GetId()] = newElement
 		}
@@ -77,6 +114,7 @@ func (ts *TaskStorage) addAfter(id string, tasks ...task.Task) {
 // addBefore inserts a task before the task with the specified ID (internal implementation)
 func (ts *TaskStorage) addBefore(id string, newTask task.Task) {
 	if element, ok := ts.idIndex[id]; ok {
+		ts.stampBirthEpoch(newTask)
 		newElement := ts.items.InsertBefore(newTask, element)
 		ts.idIndex[newTask.GetId()] = newElement
 	}
