@@ -240,6 +240,7 @@ func (op *ShellOperator) assembleShellOperator(cfg *app.Config, hooksDir string,
 
 	op.RegisterDebugQueueRoutes(debugServer)
 	op.RegisterDebugHookRoutes(debugServer)
+	op.RegisterDebugGenerationRoutes(debugServer)
 	op.RegisterDebugConfigRoutes(debugServer, runtimeConfig)
 
 	// Create webhookManagers with dependencies.
@@ -321,4 +322,12 @@ func (op *ShellOperator) setupHookManagers(cfg *app.Config, hooksDir string, tem
 		Logger:                   op.logger.Named("hook-manager"),
 	}
 	op.HookManager = hook.NewHookManager(hookCfg)
+
+	// Build the durable, staged result-commit pipeline (journal under
+	// TMP_DIR/result-generations) and recover generations left by a previous
+	// process. No-op on a bare operator without patcher/metrics storage.
+	if err := op.SetupResultCommitter(tempDir); err != nil {
+		op.logger.Error("failed to setup result generation committer, falling back to legacy path", log.Err(err))
+		op.ResultCommitter = nil
+	}
 }

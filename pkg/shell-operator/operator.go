@@ -16,7 +16,8 @@ package shell_operator
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/flant/shell-operator/pkg/hook"
 	bindingcontext "github.com/flant/shell-operator/pkg/hook/binding_context"
 	"github.com/flant/shell-operator/pkg/hook/controller"
+	"github.com/flant/shell-operator/pkg/hook/resultgen"
 	"github.com/flant/shell-operator/pkg/hook/task_metadata"
 	"github.com/flant/shell-operator/pkg/hook/types"
 	objectpatch "github.com/flant/shell-operator/pkg/kube/object_patch"
@@ -91,6 +93,14 @@ type ShellOperator struct {
 	// taskHandlerRegistry maps task types to their executor functions.
 	// Extenders (addon-operator) may register additional task types.
 	taskHandlerRegistry *TaskHandlerRegistry
+
+	// ResultCommitter drives the staged, idempotent commit of frozen hook
+	// results (object patches, values, metrics, queue conclusion). It is nil
+	// on bare/test operators, in which case the legacy direct commit path is
+	// used.
+	ResultCommitter *resultgen.Coordinator
+	// valueCommitters is the extensible values-stage slot (no-op by default).
+	valueCommitters *valueCommitterHolder
 
 	// taskFactory builds HookRun tasks. It carries no state and is exposed
 	// as a field so extenders can substitute a custom factory if needed.
@@ -164,8 +174,9 @@ func newBareShellOperator(ctx context.Context, opts ...Option) *ShellOperator {
 	cctx, cancel := context.WithCancel(ctx)
 
 	so := &ShellOperator{
-		ctx:    cctx,
-		cancel: cancel,
+		ctx:             cctx,
+		cancel:          cancel,
+		valueCommitters: &valueCommitterHolder{},
 	}
 
 	for _, opt := range opts {
@@ -333,7 +344,7 @@ func (op *ShellOperator) doShutdown(ctx context.Context) error {
 	}
 
 	op.logger.Info("shutdown done", slog.String(pkg.LogKeyPhase, "shutdown"))
-	return errors.Join(errs...)
+	return stderrors.Join(errs...)
 }
 
 // waitWG blocks until wg becomes zero or ctx is canceled.
@@ -694,34 +705,70 @@ func (op *ShellOperator) taskHandleHookRun(ctx context.Context, t task.Task) que
 		success := 0.0
 		errors := 0.0
 		allowed := 0.0
-		err = op.handleRunHook(ctx, t, taskHook, hookMeta, taskLogEntry, hookLogLabels, metricLabels)
-		if err != nil {
+		commitStatus, runErr := op.handleRunHook(ctx, t, taskHook, hookMeta, taskLogEntry, hookLogLabels, metricLabels)
+		var stagedErr *stagedCommitError
+		stagedFailure := runErr != nil && stderrors.As(runErr, &stagedErr)
+		switch {
+		case runErr != nil && stagedFailure:
+			// A failure of the staged result commit (metric validation, journal
+			// I/O, retryable patch error) is NOT a hook execution failure:
+			// AllowFailure must never swallow it as success and the task stays
+			// queued, resuming only the unfinished stages.
+			errors = 1.0
+			t.UpdateFailureMessage(runErr.Error())
+			taskLogEntry.Error("Hook result commit failed; unfinished stages will be retried",
+				slog.Int(pkg.LogKeyFailedCount, t.GetFailureCount()+1),
+				log.Err(runErr))
+			res.Status = queue.Fail
+		case runErr != nil:
+			// AllowFailure only covers the hook execution itself (non-zero
+			// exit, bad output).
 			if hookMeta.AllowFailure {
 				allowed = 1.0
-				taskLogEntry.Info("Hook failed, but allowed to fail", log.Err(err))
+				taskLogEntry.Info("Hook failed, but allowed to fail", log.Err(runErr))
 				res.Status = queue.Success
 			} else {
 				errors = 1.0
-				t.UpdateFailureMessage(err.Error())
+				t.UpdateFailureMessage(runErr.Error())
 				t.WithQueuedAt(time.Now()) // Reset queueAt for correct results in 'task_wait_in_queue' metric.
 				taskLogEntry.Error("Hook failed. Will retry after delay.",
 					slog.Int(pkg.LogKeyFailedCount, t.GetFailureCount()+1),
-					log.Err(err))
+					log.Err(runErr))
 				res.Status = queue.Fail
 			}
-		} else {
-			success = 1.0
-			taskLogEntry.Info("Hook executed successfully")
-			res.Status = queue.Success
+		default:
+			res.Status = commitStatus
+			switch commitStatus {
+			case queue.Success:
+				success = 1.0
+				taskLogEntry.Info("Hook executed successfully")
+			case queue.DeadLetter:
+				errors = 1.0
+				taskLogEntry.Error("Hook run moved to dead-letter after a terminal commit failure")
+			case queue.Repeat:
+				taskLogEntry.Info("Hook run repeated after cancellation; commit resumed from the result generation")
+			default:
+				taskLogEntry.Info("Hook run not acknowledged as success",
+					slog.String("status", string(commitStatus)))
+			}
 		}
 		op.MetricStorage.CounterAdd(metrics.HookRunAllowedErrorsTotal, allowed, metricLabels)
 		op.MetricStorage.CounterAdd(metrics.HookRunErrorsTotal, errors, metricLabels)
 		op.MetricStorage.CounterAdd(metrics.HookRunSuccessTotal, success, metricLabels)
 	}
 
-	// Unlock Kubernetes events for all monitors when Synchronization task is done.
-	if isSynchronization && res.Status == queue.Success {
-		taskLogEntry.Info("Unlock kubernetes.Event tasks")
+	// Unlock Kubernetes events for all monitors when the Synchronization task
+	// is done. A dead-lettered sync leaves the queue and is never retried, so
+	// keeping the monitors locked would silently drop every later event until
+	// restart: release the lock there as well (later events create fresh
+	// generations and may reconcile or dead-letter again). Fail/Repeat keep
+	// the historical behavior and unlock after a future success.
+	if isSynchronization && (res.Status == queue.Success || res.Status == queue.DeadLetter) {
+		if res.Status == queue.DeadLetter {
+			taskLogEntry.Warn("Unlock kubernetes.Event tasks after dead-lettered synchronization")
+		} else {
+			taskLogEntry.Info("Unlock kubernetes.Event tasks")
+		}
 		for _, monitorID := range hookMeta.MonitorIDs {
 			taskHook.HookController.UnlockKubernetesEventsFor(monitorID)
 		}
@@ -730,7 +777,7 @@ func (op *ShellOperator) taskHandleHookRun(ctx context.Context, t task.Task) que
 	return res
 }
 
-func (op *ShellOperator) handleRunHook(ctx context.Context, t task.Task, taskHook *hook.Hook, hookMeta task_metadata.HookMetadata, taskLogEntry *log.Logger, hookLogLabels map[string]string, metricLabels map[string]string) error {
+func (op *ShellOperator) handleRunHook(ctx context.Context, t task.Task, taskHook *hook.Hook, hookMeta task_metadata.HookMetadata, taskLogEntry *log.Logger, hookLogLabels map[string]string, metricLabels map[string]string) (queue.TaskStatus, error) {
 	ctx, span := otel.Tracer(serviceName).Start(ctx, "handleRunHook")
 	defer span.End()
 
@@ -743,15 +790,15 @@ func (op *ShellOperator) handleRunHook(ctx context.Context, t task.Task, taskHoo
 		if result != nil && len(result.KubernetesPatchBytes) > 0 {
 			operations, patchStatusErr := objectpatch.ParseOperations(result.KubernetesPatchBytes)
 			if patchStatusErr != nil {
-				return fmt.Errorf("%s: couldn't patch status: %s", err, patchStatusErr)
+				return queue.Fail, fmt.Errorf("%s: couldn't patch status: %s", err, patchStatusErr)
 			}
 
 			patchStatusErr = op.ObjectPatcher.ExecuteOperations(objectpatch.GetPatchStatusOperationsOnHookError(operations))
 			if patchStatusErr != nil {
-				return fmt.Errorf("%s: couldn't patch status: %s", err, patchStatusErr)
+				return queue.Fail, fmt.Errorf("%s: couldn't patch status: %s", err, patchStatusErr)
 			}
 		}
-		return err
+		return queue.Fail, err
 	}
 
 	if result.Usage != nil {
@@ -761,41 +808,137 @@ func (op *ShellOperator) handleRunHook(ctx context.Context, t task.Task, taskHoo
 		op.MetricStorage.GaugeSet(metrics.HookRunMaxRSSBytes, float64(result.Usage.MaxRss)*1024, metricLabels)
 	}
 
+	// Bare/test operators have no generation coordinator: keep the historical
+	// direct commit path (all-or-retry) for full backward compatibility.
+	if op.ResultCommitter == nil {
+		if commitErr := op.legacyCommitHookResult(result, hookMeta); commitErr != nil {
+			return queue.Fail, commitErr
+		}
+		op.saveHookResultProps(t, result, taskLogEntry)
+		return queue.Success, nil
+	}
+
+	// Freeze the parsed result and commit it through the staged, idempotent
+	// result-generation pipeline. A deterministic patch parse failure is
+	// frozen as InvalidPatch and becomes a queryable dead letter.
+	patchOpCount := 0
+	parseError := ""
+	if len(result.KubernetesPatchBytes) > 0 {
+		operations, parseErr := objectpatch.ParseOperations(result.KubernetesPatchBytes)
+		if parseErr != nil {
+			parseError = parseErr.Error()
+		} else {
+			patchOpCount = len(operations)
+		}
+	}
+
+	frozenMetrics := resultgen.FrozenMetricOpsFromExternal(result.Metrics)
+	bindingHash := resultgen.HashAny(hookMeta.BindingContext)
+	fingerprint := resultgen.ComputeFingerprint(hookMeta.HookName, bindingHash, result.KubernetesPatchBytes, frozenMetrics)
+
+	in := resultgen.CommitInput{
+		HookName:    hookMeta.HookName,
+		TaskID:      t.GetId(),
+		QueueName:   t.GetQueueName(),
+		BindingType: string(hookMeta.BindingType),
+		// Synchronous webhook executions are not queue-backed: their queue
+		// conclusion is the HTTP response and the queue stage is skipped.
+		Queued:             !isSynchronousHookExecution(ctx),
+		PatchBytes:         result.KubernetesPatchBytes,
+		Metrics:            frozenMetrics,
+		CommonMetricLabels: map[string]string{pkg.MetricKeyHook: hookMeta.HookName},
+		ParsedPatchCount:   patchOpCount,
+		ParseError:         parseError,
+	}
+	if result.AdmissionResponse != nil {
+		if raw, mErr := json.Marshal(result.AdmissionResponse); mErr == nil {
+			in.AdmissionResponseJSON = raw
+		}
+	}
+	if result.ConversionResponse != nil {
+		if raw, mErr := json.Marshal(result.ConversionResponse); mErr == nil {
+			in.ConversionResponseJSON = raw
+		}
+	}
+
+	decision := op.ResultCommitter.Commit(ctx, bindingHash, fingerprint, in)
+	switch decision.Kind {
+	case resultgen.DecisionSuccess, resultgen.DecisionSuperseded:
+		op.saveHookResultProps(t, result, taskLogEntry)
+		return queue.Success, nil
+	case resultgen.DecisionRepeat:
+		return queue.Repeat, nil
+	case resultgen.DecisionDeadLetter:
+		msg := "result generation dead-lettered"
+		if decision.Failure != nil {
+			msg = fmt.Sprintf("result generation dead-lettered: %s: %s", decision.Failure.Reason, decision.Failure.Message)
+		}
+		t.UpdateFailureMessage(msg)
+		return queue.DeadLetter, nil
+	default:
+		if decision.Err != nil {
+			t.UpdateFailureMessage(decision.Err.Error())
+		}
+		// Wrap so the caller can tell a retryable staged-commit failure apart
+		// from a hook execution failure: AllowFailure must not apply here.
+		return queue.Fail, &stagedCommitError{err: decision.Err}
+	}
+}
+
+// stagedCommitError marks retryable failures of the result-generation commit
+// pipeline (object patches, values, metrics, journal I/O). Unlike hook
+// execution failures they are never covered by AllowFailure.
+type stagedCommitError struct{ err error }
+
+func (e *stagedCommitError) Error() string {
+	if e == nil || e.err == nil {
+		return "result commit failed"
+	}
+	return e.err.Error()
+}
+
+func (e *stagedCommitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// legacyCommitHookResult applies patches and metrics directly, without a
+// result generation. It is used by bare/test operators and preserved as the
+// pre-generation behavior.
+func (op *ShellOperator) legacyCommitHookResult(result *hook.Result, hookMeta task_metadata.HookMetadata) error {
 	// Try to apply Kubernetes actions.
 	if len(result.KubernetesPatchBytes) > 0 {
 		operations, err := objectpatch.ParseOperations(result.KubernetesPatchBytes)
 		if err != nil {
 			return err
 		}
-		err = op.ObjectPatcher.ExecuteOperations(operations)
-		if err != nil {
+		if err := op.ObjectPatcher.ExecuteOperations(operations); err != nil {
 			return err
 		}
 	}
 
-	// Try to update custom metrics
-	err = op.HookMetricStorage.ApplyBatchOperations(result.Metrics, map[string]string{
+	// Try to update custom metrics.
+	return op.HookMetricStorage.ApplyBatchOperations(result.Metrics, map[string]string{
 		pkg.MetricKeyHook: hookMeta.HookName,
 	})
-	if err != nil {
-		return err
-	}
+}
 
-	// Save validatingResponse in task props for future use.
+// saveHookResultProps exposes webhook responses through task props for the
+// synchronous admission/conversion callers.
+func (op *ShellOperator) saveHookResultProps(t task.Task, result *hook.Result, taskLogEntry *log.Logger) {
 	if result.AdmissionResponse != nil {
 		t.SetProp("admissionResponse", result.AdmissionResponse)
 		taskLogEntry.Info("AdmissionResponse from hook",
 			slog.String(pkg.LogKeyValue, result.AdmissionResponse.Dump()))
 	}
 
-	// Save conversionResponse in task props for future use.
 	if result.ConversionResponse != nil {
 		t.SetProp("conversionResponse", result.ConversionResponse)
 		taskLogEntry.Info("ConversionResponse from hook",
 			slog.String(pkg.LogKeyValue, result.ConversionResponse.Dump()))
 	}
-
-	return nil
 }
 
 // CombineBindingContextForHook combines binding contexts from a sequence of task with similar

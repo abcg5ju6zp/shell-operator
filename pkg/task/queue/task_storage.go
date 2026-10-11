@@ -252,10 +252,17 @@ func (ts *TaskStorage) ProcessResult(taskRes TaskResult, t task.Task) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	// A dead-lettered task only leaves the queue: it is not acknowledged as
+	// success and no follow-up tasks from its result are scheduled.
+	if taskRes.Status == DeadLetter {
+		ts.remove(t.GetId())
+		return
+	}
+
 	// Add after tasks
 	ts.addAfter(t.GetId(), taskRes.GetAfterTasks()...)
 
-	// Remove the current task if successful
+	// Remove the current task on success.
 	if taskRes.Status == Success {
 		ts.remove(t.GetId())
 	}

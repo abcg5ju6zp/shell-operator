@@ -38,6 +38,20 @@ import (
 // ShellOperator.taskHandler satisfies this type.
 type TaskRunner func(ctx context.Context, t task.Task) queue.TaskResult
 
+// syncHookExecutionKey marks contexts of synchronous webhook hook runs, which
+// are not backed by an in-memory queue task: their result generation skips the
+// queue-conclusion stage and the HTTP response is the conclusion.
+type syncHookExecutionKey struct{}
+
+func withSynchronousHookExecution(ctx context.Context) context.Context {
+	return context.WithValue(ctx, syncHookExecutionKey{}, true)
+}
+
+func isSynchronousHookExecution(ctx context.Context) bool {
+	v, _ := ctx.Value(syncHookExecutionKey{}).(bool)
+	return v
+}
+
 // AdmissionEventHandler handles admission webhook events by creating a hook task,
 // running it synchronously, and returning the hook's admission response.
 type AdmissionEventHandler struct {
@@ -85,9 +99,11 @@ func (h *AdmissionEventHandler) Handle(ctx context.Context, event admission.Even
 		return nil, fmt.Errorf("no hook found for '%s' '%s'", event.ConfigurationId, event.WebhookId)
 	}
 
-	res := h.taskRunner(ctx, admissionTask)
+	res := h.taskRunner(withSynchronousHookExecution(ctx), admissionTask)
 
-	if res.Status == "Fail" {
+	// A terminal dead letter, a retryable commit failure or a cancellation
+	// repeat all mean the hook result is not safely committed: deny.
+	if res.Status == "Fail" || res.Status == "DeadLetter" || res.Status == "Repeat" {
 		return &admission.Response{
 			Allowed: false,
 			Message: "Hook failed",
@@ -165,9 +181,9 @@ func (h *ConversionEventHandler) Handle(ctx context.Context, crdName string, req
 				return nil, fmt.Errorf("no hook found for '%s' event for crd/%s", string(types.KubernetesConversion), crdName)
 			}
 
-			res := h.taskRunner(ctx, convTask)
+			res := h.taskRunner(withSynchronousHookExecution(ctx), convTask)
 
-			if res.Status == "Fail" {
+			if res.Status == "Fail" || res.Status == "DeadLetter" || res.Status == "Repeat" {
 				return &conversion.Response{
 					FailedMessage:    fmt.Sprintf("Hook failed to convert to %s", request.DesiredAPIVersion),
 					ConvertedObjects: nil,

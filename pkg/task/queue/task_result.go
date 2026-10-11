@@ -13,6 +13,10 @@ const (
 	Fail    TaskStatus = "Fail"
 	Repeat  TaskStatus = "Repeat"
 	Keep    TaskStatus = "Keep"
+	// DeadLetter removes a task WITHOUT acknowledging success: the
+	// generation commit reached an irreconcilable failure (recorded in the
+	// queryable dead-letter store) and queued tasks behind it must proceed.
+	DeadLetter TaskStatus = "DeadLetter"
 )
 
 type TaskResult struct {

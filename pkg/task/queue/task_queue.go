@@ -918,6 +918,24 @@ func (q *TaskQueue) processOne(ctx context.Context, t task.Task) (time.Duration,
 			t.SetProcessing(false)
 			nextSleepDelay = q.DelayOnRepeat
 			q.SetStatus(QueueStatusRepeatTask)
+		case DeadLetter:
+			if len(taskRes.GetAfterTasks()) > 0 || len(taskRes.GetHeadTasks()) > 0 || len(taskRes.GetTailTasks()) > 0 {
+				q.logger.Warn("result is dead-letter, cannot process tasks in result",
+					slog.Int(pkg.LogKeyAfterTaskCount, len(taskRes.GetAfterTasks())),
+					slog.Int(pkg.LogKeyHeadTaskCount, len(taskRes.GetHeadTasks())),
+					slog.Int(pkg.LogKeyTailTaskCount, len(taskRes.GetTailTasks())))
+			}
+
+			// The task leaves the queue without a success acknowledgment; its
+			// terminal failure is queryable via the generation journal. No
+			// backoff: the next task proceeds immediately.
+			q.withLock(func() {
+				q.storage.ProcessResult(taskRes, t)
+				t.SetProcessing(false)
+			})
+			t.IncrementFailureCount()
+			q.SetStatus(QueueStatusIdle)
+			q.SetStatusText("task moved to dead-letter after a terminal failure")
 		}
 
 		if taskRes.DelayBeforeNextTask != 0 {
@@ -1147,7 +1165,7 @@ func isNil(v interface{}) bool {
 	// Use reflection to check if the interface contains a nil concrete value
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return rv.IsNil()
 	default:
 		return false
