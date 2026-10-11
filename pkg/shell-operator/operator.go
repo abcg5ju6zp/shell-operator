@@ -29,6 +29,7 @@ import (
 
 	klient "github.com/flant/kube-client/client"
 	pkg "github.com/flant/shell-operator/pkg"
+	"github.com/flant/shell-operator/pkg/executor"
 	"github.com/flant/shell-operator/pkg/hook"
 	bindingcontext "github.com/flant/shell-operator/pkg/hook/binding_context"
 	"github.com/flant/shell-operator/pkg/hook/controller"
@@ -313,6 +314,18 @@ func (op *ShellOperator) doShutdown(ctx context.Context) error {
 		if err := op.ConversionWebhookManager.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("conversion webhook: %w", err))
 		}
+	}
+
+	// Queues and webhook servers are drained and their contexts were canceled
+	// at the beginning of shutdown, so every in-flight hook execution has
+	// already asked its process group to terminate. Wait for the subprocesses
+	// to be reaped (including detached SIGKILL-resistant ones) so no hook
+	// process outlives the operator. A timeout here is reported but does not
+	// block the rest of the shutdown.
+	if err := executor.Wait(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("hook subprocesses: %w", err))
+	} else {
+		op.logger.Info("all hook subprocesses are reaped", slog.String(pkg.LogKeyPhase, "shutdown"))
 	}
 
 	if op.DebugServer != nil {

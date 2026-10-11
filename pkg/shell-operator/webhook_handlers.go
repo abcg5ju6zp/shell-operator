@@ -87,6 +87,18 @@ func (h *AdmissionEventHandler) Handle(ctx context.Context, event admission.Even
 
 	res := h.taskRunner(ctx, admissionTask)
 
+	admissionProp := admissionTask.GetProp("admissionResponse")
+	admissionResponse, ok := admissionProp.(*admission.Response)
+
+	// The review is already over (API server disconnected, its deadline
+	// expired or the process is shutting down) and the hook did not produce a
+	// reusable verdict: surface an identifiable timeout instead of the generic
+	// "Hook failed" denial. A verdict that did land before cancellation is
+	// preserved — the original allow/deny must not be replaced by a timeout.
+	if !ok && ctx.Err() != nil {
+		return nil, fmt.Errorf("admission review interrupted: %w: %v", admission.ErrReviewTimeout, ctx.Err())
+	}
+
 	if res.Status == "Fail" {
 		return &admission.Response{
 			Allowed: false,
@@ -94,8 +106,6 @@ func (h *AdmissionEventHandler) Handle(ctx context.Context, event admission.Even
 		}, nil
 	}
 
-	admissionProp := admissionTask.GetProp("admissionResponse")
-	admissionResponse, ok := admissionProp.(*admission.Response)
 	if !ok {
 		logEntry.Error("'admissionResponse' task prop is not of type *AdmissionResponse",
 			slog.String(pkg.LogKeyType, fmt.Sprintf("%T", admissionProp)))

@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"context"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // ProcessTracker is a read-only view into the process registry.
@@ -26,7 +28,8 @@ type processRegistry struct {
 	activePIDs map[int]struct{}
 }
 
-// register adds pid to the set of active PIDs.
+// register adds pid to the set of active PIDs. Registering a PID that is
+// already tracked is a no-op.
 func (r *processRegistry) register(pid int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -34,12 +37,44 @@ func (r *processRegistry) register(pid int) {
 	r.activePIDs[pid] = struct{}{}
 }
 
-// unregister removes pid from the set of active PIDs.
+// unregister removes pid from the set of active PIDs. It is idempotent:
+// unregistering a PID that was never registered (or already unregistered,
+// e.g. by a detached reaper) does nothing and never panics.
 func (r *processRegistry) unregister(pid int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	delete(r.activePIDs, pid)
+}
+
+// waitPollInterval is the resolution at which Wait observes the registry.
+const waitPollInterval = 50 * time.Millisecond
+
+// Wait blocks until the registry contains no active PIDs (every executor
+// subprocess has been reaped) or ctx is canceled. It is used during process
+// shutdown to wait for in-flight hook executions: canceled commands are
+// terminated through their own context and unregister as soon as cmd.Wait
+// returns, while processes that could not be killed stay registered until
+// the detached reaper finishes.
+func (r *processRegistry) Wait(ctx context.Context) error {
+	ticker := time.NewTicker(waitPollInterval)
+	defer ticker.Stop()
+
+	for {
+		r.mu.RLock()
+		remaining := len(r.activePIDs)
+		r.mu.RUnlock()
+
+		if remaining == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // startAndRegister calls cmd.Start() and, on success, registers the child
@@ -97,4 +132,12 @@ func unregisterPID(pid int) {
 // unregisterPID(cmd.Process.Pid) (typically via defer) when cmd.Wait returns.
 func startAndRegister(cmd *exec.Cmd) error {
 	return registry.startAndRegister(cmd)
+}
+
+// Wait blocks until all executor-managed subprocesses are reaped or ctx
+// expires. Call it during process shutdown after request and queue contexts
+// have been canceled so the executor has signaled the in-flight process
+// groups to terminate.
+func Wait(ctx context.Context) error {
+	return registry.Wait(ctx)
 }

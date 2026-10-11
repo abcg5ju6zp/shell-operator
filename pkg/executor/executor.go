@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -158,6 +160,23 @@ type CmdUsage struct {
 	MaxRss int64
 }
 
+// Grace periods used when a hook command must be stopped because its context
+// is canceled (client disconnect, same-UID retry superseding it, process
+// shutdown). The whole process group is asked to terminate first and then
+// force-killed. If it still cannot be reaped after SIGKILL, the wait is
+// detached (see RunAndLogLines).
+const (
+	terminateGracePeriod = 3 * time.Second
+	killGracePeriod      = 2 * time.Second
+)
+
+// runOutcome carries cmd.Wait result and resource usage back from the
+// goroutine that waits for a command.
+type runOutcome struct {
+	usage *CmdUsage
+	err   error
+}
+
 func (e *Executor) RunAndLogLines(ctx context.Context, logLabels map[string]string) (*CmdUsage, error) {
 	ctx, span := otel.Tracer(serviceName).Start(ctx, "RunAndLogLines")
 	defer span.End()
@@ -187,39 +206,191 @@ func (e *Executor) RunAndLogLines(ctx context.Context, logLabels map[string]stri
 		buf:              make([]byte, 0),
 	}
 
-	e.cmd.Stdout = plo
-	e.cmd.Stderr = io.MultiWriter(ple, stdErr)
+	// Wrap the output writers so late output of a canceled/superseded
+	// execution can be isolated: a process that ignores SIGTERM keeps the
+	// pipes open, but nothing it writes afterwards may reach logs or metrics.
+	stdoutWriter := &isolatingWriter{w: plo}
+	stderrWriter := &isolatingWriter{w: io.MultiWriter(ple, stdErr)}
+	e.cmd.Stdout = stdoutWriter
+	e.cmd.Stderr = stderrWriter
+
+	// Hooks are shell scripts that may spawn their own children. Start the
+	// command in its own process group so cancellation can signal the whole
+	// group at once instead of killing only the shell and orphaning children.
+	ensureProcessGroup(e.cmd)
 
 	if err := startAndRegister(e.cmd); err != nil {
 		return nil, fmt.Errorf("cmd start: %w", err)
 	}
-	defer unregisterPID(e.cmd.Process.Pid)
+	pid := e.cmd.Process.Pid
 
+	waitCh := make(chan runOutcome, 1)
+	go func() {
+		waitCh <- e.waitCommand(stdErr)
+	}()
+
+	select {
+	case out := <-waitCh:
+		unregisterPID(pid)
+		return out.usage, out.err
+	case <-ctx.Done():
+		// Request is canceled (API server disconnected, a same-UID retry
+		// superseded this execution or the process is shutting down).
+		// Isolate late results first, then stop the subprocess.
+		stdoutWriter.Isolate()
+		stderrWriter.Isolate()
+
+		// If the process finished at the same instant, honor its outcome.
+		select {
+		case out := <-waitCh:
+			unregisterPID(pid)
+			return out.usage, out.err
+		default:
+		}
+
+		_, abortErr := e.cancelProcessGroup(pid, waitCh)
+		if abortErr == nil {
+			unregisterPID(pid)
+			return nil, fmt.Errorf("cmd canceled: %w", ctx.Err())
+		}
+
+		// The process cannot be stopped even with SIGKILL (e.g. stuck in
+		// uninterruptible disk sleep). Detach the reaper instead of blocking
+		// the handler/shutdown: late output is already isolated, callers
+		// proceed with temp-file cleanup, and the PID stays registered (the
+		// zombie reaper must keep skipping it; Wait keeps accounting for it)
+		// until the background wait finally releases it.
+		logEntry.Error("hook process did not stop after SIGKILL, reaping detached",
+			slog.Int("pid", pid),
+			log.Err(abortErr))
+		go func() {
+			out := <-waitCh
+			unregisterPID(pid)
+			if out.err != nil {
+				e.logger.Debug("detached hook process reaped", log.Err(out.err))
+			}
+		}()
+
+		return nil, fmt.Errorf("cmd canceled: %w", errors.Join(ctx.Err(), abortErr))
+	}
+}
+
+// waitCommand waits for the command and converts the result into a runOutcome
+// preserving the historical error behavior (stderr content wins, otherwise
+// the wait error is wrapped as "cmd run").
+func (e *Executor) waitCommand(stdErr *bytes.Buffer) runOutcome {
 	err := e.cmd.Wait()
 	if err != nil {
 		if len(stdErr.Bytes()) > 0 {
-			return nil, &StderrError{Message: stdErr.String()}
+			return runOutcome{err: &StderrError{Message: stdErr.String()}}
 		}
 
-		return nil, fmt.Errorf("cmd run: %w", err)
+		return runOutcome{err: fmt.Errorf("cmd run: %w", err)}
 	}
 
-	var usage *CmdUsage
-	if e.cmd.ProcessState != nil {
-		usage = &CmdUsage{
-			Sys:  e.cmd.ProcessState.SystemTime(),
-			User: e.cmd.ProcessState.UserTime(),
-		}
+	return runOutcome{usage: collectUsage(e.cmd.ProcessState)}
+}
 
-		// FIXME Maxrss is Unix specific.
-		sysUsage := e.cmd.ProcessState.SysUsage()
-		if v, ok := sysUsage.(*syscall.Rusage); ok {
-			// v.Maxrss is int32 on arm/v7
-			usage.MaxRss = int64(v.Maxrss) //nolint:unconvert
-		}
+// collectUsage builds CmdUsage from the finished process state.
+func collectUsage(state *os.ProcessState) *CmdUsage {
+	if state == nil {
+		return nil
 	}
 
-	return usage, nil
+	usage := &CmdUsage{
+		Sys:  state.SystemTime(),
+		User: state.UserTime(),
+	}
+
+	// FIXME Maxrss is Unix specific.
+	sysUsage := state.SysUsage()
+	if v, ok := sysUsage.(*syscall.Rusage); ok {
+		// v.Maxrss is int32 on arm/v7
+		usage.MaxRss = int64(v.Maxrss) //nolint:unconvert
+	}
+
+	return usage
+}
+
+// ensureProcessGroup makes cmd start as the leader of its own process group.
+// Existing SysProcAttr (e.g. Chroot) is preserved and augmented.
+func ensureProcessGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return
+	}
+	cmd.SysProcAttr.Setpgid = true
+}
+
+// cancelProcessGroup signals the command's process group (negative PID targets
+// every process in the group) and waits for the detached wait to finish:
+// SIGTERM with a grace period, then SIGKILL with a grace period. Signaling an
+// already-dead group is expected and ignored. A non-nil error means the group
+// still could not be reaped and the caller must detach the wait.
+func (e *Executor) cancelProcessGroup(pid int, waitCh <-chan runOutcome) (runOutcome, error) {
+	return cancelProcess(waitCh, func(sig syscall.Signal) {
+		_ = syscall.Kill(-pid, sig)
+	})
+}
+
+// cancelProcess drives the TERM → KILL escalation against an injectable kill
+// function. It returns the reaped outcome as soon as waitCh delivers, or a
+// non-nil error when neither signal made the process exit within its grace
+// period — in that case the caller detaches the wait.
+func cancelProcess(waitCh <-chan runOutcome, kill func(sig syscall.Signal)) (runOutcome, error) {
+	kill(syscall.SIGTERM)
+	if out, ok := receiveOutcome(waitCh, terminateGracePeriod); ok {
+		return out, nil
+	}
+
+	kill(syscall.SIGKILL)
+	if out, ok := receiveOutcome(waitCh, killGracePeriod); ok {
+		return out, nil
+	}
+
+	return runOutcome{}, fmt.Errorf("process did not exit after SIGTERM/SIGKILL")
+}
+
+// receiveOutcome waits up to d for the detached command wait to complete.
+func receiveOutcome(ch <-chan runOutcome, d time.Duration) (runOutcome, bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case out := <-ch:
+		return out, true
+	case <-timer.C:
+		return runOutcome{}, false
+	}
+}
+
+// isolatingWriter forwards writes to w until Isolate is called; afterwards it
+// silently consumes everything. It lets a canceled hook subprocess keep
+// writing (no broken-pipe feedback) while guaranteeing its late output cannot
+// contaminate logs, metrics or temporary results of the current execution.
+type isolatingWriter struct {
+	mu       sync.Mutex
+	w        io.Writer
+	isolated bool
+}
+
+func (i *isolatingWriter) Write(p []byte) (int, error) {
+	i.mu.Lock()
+	w := i.w
+	isolated := i.isolated
+	i.mu.Unlock()
+
+	if isolated {
+		return len(p), nil
+	}
+
+	return w.Write(p)
+}
+
+func (i *isolatingWriter) Isolate() {
+	i.mu.Lock()
+	i.isolated = true
+	i.mu.Unlock()
 }
 
 type proxyLogger struct {

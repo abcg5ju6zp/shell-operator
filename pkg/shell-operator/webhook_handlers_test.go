@@ -171,6 +171,89 @@ func TestAdmissionEventHandler_Handle_badPropType_returnsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestAdmissionEventHandler_Handle_canceledWithoutVerdict_returnsTimeout
+// ensures a canceled review (client disconnect/shutdown) where the hook
+// produced no verdict surfaces the identifiable timeout error instead of the
+// generic "Hook failed" denial.
+func TestAdmissionEventHandler_Handle_canceledWithoutVerdict_returnsTimeout(t *testing.T) {
+	hm := &stubHookManager{
+		handleAdmissionEventFunc: func(_ context.Context, _ admission.Event, fn func(*hook.Hook, controller.BindingExecutionInfo)) {
+			fn(makeMinimalHook("test-hook"), controller.BindingExecutionInfo{})
+		},
+	}
+	runner := func(_ context.Context, _ task.Task) queue.TaskResult {
+		// The hook subprocess was killed by the canceled context.
+		return queue.TaskResult{Status: queue.Fail}
+	}
+	h := NewAdmissionEventHandler(hm, runner, HookTaskFactory{}, log.NewNop())
+	event := admission.Event{
+		WebhookId:       "wh1",
+		ConfigurationId: "cfg1",
+		Request:         &admissionv1.AdmissionRequest{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resp, err := h.Handle(ctx, event)
+	assert.Nil(t, resp)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, admission.ErrReviewTimeout)
+}
+
+// TestAdmissionEventHandler_Handle_canceledWithVerdict_preservesVerdict
+// ensures the hook's original judgment is kept when it landed just before the
+// cancellation (the client disconnected while post-run work was finishing).
+func TestAdmissionEventHandler_Handle_canceledWithVerdict_preservesVerdict(t *testing.T) {
+	want := &admission.Response{Allowed: true, Warnings: []string{"late-allow"}}
+	hm := &stubHookManager{
+		handleAdmissionEventFunc: func(_ context.Context, _ admission.Event, fn func(*hook.Hook, controller.BindingExecutionInfo)) {
+			fn(makeMinimalHook("test-hook"), controller.BindingExecutionInfo{})
+		},
+	}
+	runner := func(_ context.Context, t task.Task) queue.TaskResult {
+		t.SetProp("admissionResponse", want)
+		return queue.TaskResult{Status: queue.Success}
+	}
+	h := NewAdmissionEventHandler(hm, runner, HookTaskFactory{}, log.NewNop())
+	event := admission.Event{
+		WebhookId:       "wh1",
+		ConfigurationId: "cfg1",
+		Request:         &admissionv1.AdmissionRequest{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resp, err := h.Handle(ctx, event)
+	require.NoError(t, err)
+	assert.Equal(t, want, resp)
+}
+
+// TestAdmissionEventHandler_Handle_panicPropagates verifies a runner panic is
+// not swallowed inside the event handler (the admission HTTP layer converts
+// it into a deterministic deny and releases the UID registration).
+func TestAdmissionEventHandler_Handle_panicPropagates(t *testing.T) {
+	hm := &stubHookManager{
+		handleAdmissionEventFunc: func(_ context.Context, _ admission.Event, fn func(*hook.Hook, controller.BindingExecutionInfo)) {
+			fn(makeMinimalHook("test-hook"), controller.BindingExecutionInfo{})
+		},
+	}
+	runner := func(_ context.Context, _ task.Task) queue.TaskResult {
+		panic("queue exploded")
+	}
+	h := NewAdmissionEventHandler(hm, runner, HookTaskFactory{}, log.NewNop())
+	event := admission.Event{
+		WebhookId:       "wh1",
+		ConfigurationId: "cfg1",
+		Request:         &admissionv1.AdmissionRequest{},
+	}
+
+	assert.Panics(t, func() {
+		_, _ = h.Handle(context.Background(), event)
+	})
+}
+
 // ---- ConversionEventHandler tests ----
 
 func TestConversionEventHandler_Handle_noConversionPath_returnsNilError(t *testing.T) {

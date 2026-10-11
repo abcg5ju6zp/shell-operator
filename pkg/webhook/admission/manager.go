@@ -140,6 +140,12 @@ func (m *WebhookManager) AddMutatingWebhook(config *MutatingWebhookConfig) {
 }
 
 func (m *WebhookManager) Start(ctx context.Context) error {
+	// Bind in-flight reviews to the operator lifetime: canceling ctx on
+	// shutdown propagates to every hook queue and subprocess.
+	if m.Handler != nil {
+		m.Handler.BaseContext = ctx
+	}
+
 	err := m.Server.Start()
 	if err != nil {
 		return fmt.Errorf("start webhook server: %w", err)

@@ -139,7 +139,9 @@ func (h *Hook) Run(ctx context.Context, _ htypes.BindingType, context []bctx.Bin
 
 	result.Usage, err = hookCmd.RunAndLogLines(ctx, logLabels)
 	if err != nil {
-		return result, fmt.Errorf("%s FAILED: %s", h.Name, err)
+		// %w keeps the wrapping intact so callers can recognize context
+		// cancellation (errors.Is(err, context.Canceled)) behind the hook name.
+		return result, fmt.Errorf("%s FAILED: %w", h.Name, err)
 	}
 
 	if err = h.responseParser.ParseResult(h.Name, env, result); err != nil {
